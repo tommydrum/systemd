@@ -1435,39 +1435,36 @@ static void output_unit_file_list(const UnitFileList *units, unsigned c) {
                        ansi_normal());
 
         for (u = units; u < units + c; u++) {
+                const char *on_underline = NULL, *on_color = NULL, *off = NULL, *id;
                 _cleanup_free_ char *e = NULL;
-                const char *on, *off, *on_underline = "", *off_underline = "";
-                const char *id;
-                bool underline = false;
+                bool underline;
 
-                if (u + 1 < units + c &&
-                    !streq(unit_type_suffix(u->path), unit_type_suffix((u + 1)->path))) {
+                underline = u + 1 < units + c &&
+                        !streq(unit_type_suffix(u->path), unit_type_suffix((u + 1)->path));
+
+                if (underline)
                         on_underline = ansi_underline();
-                        off_underline = ansi_normal();
-                        underline = true;
-                }
 
                 if (IN_SET(u->state,
                            UNIT_FILE_MASKED,
                            UNIT_FILE_MASKED_RUNTIME,
                            UNIT_FILE_DISABLED,
                            UNIT_FILE_BAD))
-                        on  = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
+                        on_color = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
                 else if (u->state == UNIT_FILE_ENABLED)
-                        on  = underline ? ansi_highlight_green_underline() : ansi_highlight_green();
-                else
-                        on = on_underline;
-                off = off_underline;
+                        on_color = underline ? ansi_highlight_green_underline() : ansi_highlight_green();
+
+                if (on_underline || on_color)
+                        off = ansi_normal();
 
                 id = basename(u->path);
 
                 e = arg_full ? NULL : ellipsize(id, id_cols, 33);
 
-                printf("%s%-*s %s%-*s%s%s\n",
-                       on_underline,
+                printf("%s%-*s %s%-*s%s\n",
+                       strempty(on_underline),
                        id_cols, e ? e : id,
-                       on, state_cols, unit_file_state_to_string(u->state), off,
-                       off_underline);
+                       strempty(on_color), state_cols, unit_file_state_to_string(u->state), strempty(off));
         }
 
         if (!arg_no_legend)
@@ -2480,7 +2477,6 @@ static int unit_file_find_path(LookupPaths *lp, const char *unit_name, char **un
 
         assert(lp);
         assert(unit_name);
-        assert(unit_path);
 
         STRV_FOREACH(p, lp->search_path) {
                 _cleanup_free_ char *path = NULL, *lpath = NULL;
@@ -2498,12 +2494,46 @@ static int unit_file_find_path(LookupPaths *lp, const char *unit_name, char **un
                 if (r < 0)
                         return log_error_errno(r, "Failed to access path '%s': %m", path);
 
-                *unit_path = lpath;
-                lpath = NULL;
+                if (unit_path) {
+                        *unit_path = lpath;
+                        lpath = NULL;
+                }
                 return 1;
         }
 
         return 0;
+}
+
+static int unit_find_template_path(
+                const char *unit_name,
+                LookupPaths *lp,
+                char **fragment_path,
+                char **template) {
+
+        _cleanup_free_ char *_template = NULL;
+        int r;
+
+        /* Returns 1 if a fragment was found, 0 if not found, negative on error. */
+
+        r = unit_file_find_path(lp, unit_name, fragment_path);
+        if (r != 0)
+                return r; /* error or found a real unit */
+
+        r = unit_name_template(unit_name, &_template);
+        if (r == -EINVAL)
+                return 0; /* not a template, does not exist */
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine template name: %m");
+
+        r = unit_file_find_path(lp, _template, fragment_path);
+        if (r < 0)
+                return r;
+
+        if (template) {
+                *template = _template;
+                _template = NULL;
+        }
+        return r;
 }
 
 static int unit_find_paths(
@@ -2561,29 +2591,18 @@ static int unit_find_paths(
                                 return log_error_errno(r, "Failed to get DropInPaths: %s", bus_error_message(&error, r));
                 }
         } else {
-                _cleanup_set_free_ Set *names;
+                _cleanup_set_free_ Set *names = NULL;
                 _cleanup_free_ char *template = NULL;
 
                 names = set_new(NULL);
                 if (!names)
                         return log_oom();
 
-                r = unit_file_find_path(lp, unit_name, &path);
+                r = unit_find_template_path(unit_name, lp, &path, &template);
                 if (r < 0)
                         return r;
 
-                if (r == 0) {
-                        r = unit_name_template(unit_name, &template);
-                        if (r < 0 && r != -EINVAL)
-                                return log_error_errno(r, "Failed to determine template name: %m");
-                        if (r >= 0) {
-                                r = unit_file_find_path(lp, template, &path);
-                                if (r < 0)
-                                        return r;
-                        }
-                }
-
-                if (path)
+                if (r > 0)
                         /* We found the unit file. If we followed symlinks, this name might be
                          * different then the unit_name with started with. Look for dropins matching
                          * that "final" name. */
@@ -6094,7 +6113,7 @@ static int normalize_names(char **names, bool warn_if_path) {
         return 0;
 }
 
-static int unit_exists(const char *unit) {
+static int unit_exists(LookupPaths *lp, const char *unit) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_free_ char *path = NULL;
@@ -6106,6 +6125,9 @@ static int unit_exists(const char *unit) {
         UnitStatusInfo info = {};
         sd_bus *bus;
         int r;
+
+        if (unit_name_is_valid(unit, UNIT_NAME_TEMPLATE))
+                return unit_find_template_path(unit, lp, NULL, NULL);
 
         path = unit_dbus_path_from_name(unit);
         if (!path)
@@ -6211,11 +6233,20 @@ static int enable_unit(int argc, char *argv[], void *userdata) {
                 sd_bus *bus;
 
                 if (STR_IN_SET(verb, "mask", "unmask")) {
-                        r = unit_exists(*names);
+                        char **name;
+                        _cleanup_lookup_paths_free_ LookupPaths lp = {};
+
+                        r = lookup_paths_init(&lp, arg_scope, 0, arg_root);
                         if (r < 0)
                                 return r;
-                        if (r == 0)
-                                log_notice("Unit %s does not exist, proceeding anyway.", *names);
+
+                        STRV_FOREACH(name, names) {
+                                r = unit_exists(&lp, *name);
+                                if (r < 0)
+                                        return r;
+                                if (r == 0)
+                                        log_notice("Unit %s does not exist, proceeding anyway.", *names);
+                        }
                 }
 
                 r = acquire_bus(BUS_MANAGER, &bus);
